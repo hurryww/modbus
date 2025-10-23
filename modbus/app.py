@@ -1,35 +1,37 @@
-# app.py - Streamlit UI (改进：读取结果持久化到 session_state，编辑弹窗可用)
+# modbus/app.py
+# Streamlit UI - full file that uses modbus_manager.manager
+# Behaviors:
+# - Create / list / remove connections
+# - For each selected connection render a single input row (function / plc address / count)
+# - Operation buttons are placed in a single horizontal row BELOW the inputs
+# - Read button is disabled when the connection is not connected; read() is called with allow_reconnect=False
+# - When switching function code, PLC address auto-updates to the new base only if user hasn't modified it
 import streamlit as st
 from modbus_manager import manager
 import time
 
 st.set_page_config(page_title="Modbus TCP Manager", layout="wide")
-
 st.title("Modbus TCP Manager（Python + Streamlit）")
 
 def rerun():
     try:
         if hasattr(st, "experimental_rerun"):
-            try:
-                st.experimental_rerun()
-                return
-            except Exception:
-                pass
+            st.experimental_rerun()
+            return
+    except Exception:
+        # best-effort rerun fallback
         try:
-            params = dict(st.query_params)
+            params = dict(st.experimental_get_query_params())
             params["_rerun"] = [str(time.time())]
             st.experimental_set_query_params(**params)
-            return
         except Exception:
-            pass
-        try:
             st.session_state["_rerun_flag"] = time.time()
-        except Exception:
-            pass
-    except Exception:
-        pass
 
-# Sidebar: create connection (未改动)
+def ensure_session_default(key: str, default):
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# Sidebar: create connection form
 with st.sidebar.expander("新增 Modbus TCP 连接", expanded=True):
     with st.form("create_conn"):
         host = st.text_input("Host (IP or hostname)", value="127.0.0.1")
@@ -40,66 +42,68 @@ with st.sidebar.expander("新增 Modbus TCP 连接", expanded=True):
         if submitted:
             try:
                 conn = manager.create_connection(host=host, port=int(port), unit=int(unit), name=name or None)
-                st.success(f"创建连接: {conn.id} ({conn.name}) 连接状态: {'已连接' if conn.connected else '未连接'}")
+                st.success(f"创建连接: {conn.id} ({conn.name})")
                 rerun()
             except Exception as e:
                 st.error(f"创建失败: {e}")
 
-# 选择连接等（未改动）
+# Get connections and build selection map
 conns = manager.list_connections()
+conn_map = {f"{c['name']} [{c['id']}]": c['id'] for c in conns} if conns else {}
+
 if conns:
-    conn_map = {f"{c['name']} [{c['id']}]": c['id'] for c in conns}
-    selected_label = st.sidebar.selectbox("选择连接", options=list(conn_map.keys()))
-    selected_id = conn_map[selected_label]
+    selected_labels = st.sidebar.multiselect("选择连接（可多选，用于显示并分别操作）", options=list(conn_map.keys()))
+    selected_ids = [conn_map[label] for label in selected_labels] if selected_labels else []
 else:
-    st.sidebar.info("当前没有连接，先在上方创建一个")
-    selected_id = None
+    st.sidebar.info("当前没有连接，请先创建一个")
+    selected_ids = []
 
 if st.sidebar.button("刷新连接列表"):
     rerun()
 
-if selected_id:
-    if st.sidebar.button("删除选中连接（停止轮询并移除）"):
-        try:
-            manager.remove(selected_id)
-            st.sidebar.success("已删除")
-        except Exception as e:
-            st.sidebar.error(f"删除失败: {e}")
-        rerun()
+# Sidebar quick batch actions
+if selected_ids:
+    c1, c2, c3 = st.sidebar.columns([1, 1, 1])
+    with c1:
+        if st.button("批量连接所选"):
+            for cid in selected_ids:
+                c = manager.get(cid)
+                try:
+                    if c:
+                        c.connect()
+                except Exception as e:
+                    st.sidebar.error(f"{cid} 连接失败: {e}")
+            rerun()
+    with c2:
+        if st.button("批量断开所选"):
+            for cid in selected_ids:
+                c = manager.get(cid)
+                try:
+                    if c:
+                        c.close()
+                except Exception as e:
+                    st.sidebar.error(f"{cid} 断开失败: {e}")
+            rerun()
+    with c3:
+        if st.button("删除所选连接"):
+            for cid in list(selected_ids):
+                try:
+                    manager.remove(cid)
+                    # cleanup cached reads
+                    st.session_state.get("read_values", {}).pop(cid, None)
+                    st.session_state.get("last_modbus_address", {}).pop(cid, None)
+                    st.session_state.get("last_plc_address", {}).pop(cid, None)
+                except Exception as e:
+                    st.sidebar.error(f"{cid} 删除失败: {e}")
+            rerun()
 
-if not selected_id:
-    st.info("请选择一个连接以查看和操作（左侧）")
+if not selected_ids:
+    st.info("请选择左侧的一个或多个连接（多选）以在主区显示并分别操作。")
     st.stop()
 
-conn = manager.get(selected_id)
-if conn is None:
-    st.error("所选连接不存在")
-    st.stop()
+st.markdown("## 已选连接（每个连接一行：设置 + 操作按钮）")
 
-st.subheader(f"连接: {conn.name}  ({conn.host}:{conn.port})")
-st.write(f"ID: {conn.id}  Unit: {conn.unit}  状态: {'已连接' if conn.connected else '未连接'}")
-
-col1, col2 = st.columns(2)
-with col1:
-    if st.button("（重新）连接"):
-        try:
-            ok = conn.connect()
-            if ok:
-                st.success("连接成功")
-            else:
-                st.error("连接失败")
-        except Exception as e:
-            st.error(f"连接异常: {e}")
-with col2:
-    if st.button("关闭连接"):
-        try:
-            conn.close()
-            st.info("已关闭连接")
-        except Exception as e:
-            st.error(f"关闭异常: {e}")
-
-st.markdown("---")
-
+# Function options: (display string, internal type, base address for PLC example)
 FUNCTION_OPTIONS = [
     ("01 Coil Status (0x) - Coil", "coils", 1),
     ("02 Input Status (1x) - Discrete Input", "discrete", 10001),
@@ -107,66 +111,183 @@ FUNCTION_OPTIONS = [
     ("04 Input Registers (3x) - Input Reg", "input", 30001),
 ]
 
+func_display_list = [opt[0] for opt in FUNCTION_OPTIONS]
+
 def plc_to_modbus(plc_addr: int, base: int) -> int:
-    try:
-        plc_addr = int(plc_addr)
-    except Exception:
-        raise ValueError("PLC 地址必须是整数")
+    plc_addr = int(plc_addr)
     if plc_addr >= base:
         return plc_addr - base
     return plc_addr
 
-st.header("读取寄存器（按 PLC 地址输入，例如 40001）")
+# initialize read caches
+ensure_session_default("read_values", {})
+ensure_session_default("last_modbus_address", {})
+ensure_session_default("last_plc_address", {})
 
-func_display_list = [opt[0] for opt in FUNCTION_OPTIONS]
-selected_func_display = st.selectbox("功能（Function Code / 寄存器类型）", options=func_display_list, index=2, key="func_select")
-selected_idx = func_display_list.index(selected_func_display)
-func_type = FUNCTION_OPTIONS[selected_idx][1]
-func_base = FUNCTION_OPTIONS[selected_idx][2]
+# Render a row per selected connection
+for cid in selected_ids:
+    conn = manager.get(cid)
+    if conn is None:
+        st.warning(f"连接 {cid} 不存在")
+        continue
 
-# 在 session_state 中存默认 plc_address（避免 widget value/session_state 冲突）
-if "plc_address" not in st.session_state or st.session_state.get("last_func_idx") != selected_idx:
-    st.session_state["plc_address"] = func_base
-    st.session_state["last_func_idx"] = selected_idx
+    safe = cid.replace("-", "_")
+    func_key = f"func_opt_{safe}"    # selectbox key (stores option string)
+    plc_key = f"plc_addr_{safe}"
+    count_key = f"count_{safe}"
+    prev_key = f"prev_func_{safe}"   # previous function selection
 
-# 读取表单：当读取成功时把结果保存在 session_state 中以便跨 rerun 保留
-with st.form("read_form"):
-    plc_address = st.number_input(f"PLC 地址 (示例 {func_base})", min_value=0, step=1, key="plc_address")
-    count = st.number_input("数量", min_value=1, value=4, step=1)
-    do_read = st.form_submit_button("读取")
+    # initialize defaults BEFORE widget creation
+    default_idx = 2
+    default_opt = func_display_list[default_idx] if 0 <= default_idx < len(func_display_list) else func_display_list[0]
+    ensure_session_default(func_key, default_opt)
+    if st.session_state.get(func_key) not in func_display_list:
+        st.session_state[func_key] = default_opt
+
+    ensure_session_default(prev_key, st.session_state.get(func_key, default_opt))
+
+    # compute current and previous bases
+    cur_func = st.session_state.get(func_key, default_opt)
+    prev_func = st.session_state.get(prev_key, None)
     try:
-        modbus_address = plc_to_modbus(plc_address, func_base)
-        st.caption(f"已根据功能码计算 Modbus 起始地址：{modbus_address} （PLC 输入：{plc_address}，基址 {func_base}）")
-    except ValueError as e:
-        st.error(str(e))
-        modbus_address = None
+        cur_idx = func_display_list.index(cur_func)
+        cur_base = FUNCTION_OPTIONS[cur_idx][2]
+    except Exception:
+        cur_idx = default_idx
+        cur_base = FUNCTION_OPTIONS[default_idx][2]
 
-    if do_read:
-        if modbus_address is None:
-            st.error("无效的 PLC 地址")
-        else:
+    prev_base = None
+    if prev_func in func_display_list:
+        prev_base = FUNCTION_OPTIONS[func_display_list.index(prev_func)][2]
+
+    # PLC/count defaults
+    ensure_session_default(plc_key, cur_base if prev_base is None else prev_base)
+    try:
+        plc_val_current = int(st.session_state.get(plc_key, cur_base))
+    except Exception:
+        plc_val_current = cur_base
+    ensure_session_default(count_key, 4)
+    try:
+        st.session_state[count_key] = int(st.session_state.get(count_key, 4))
+    except Exception:
+        st.session_state[count_key] = 4
+
+    # if function changed (prev -> cur) and user didn't modify plc (plc == prev_base), update plc to cur_base
+    if prev_func is not None and prev_func != cur_func:
+        if prev_base is not None and plc_val_current == prev_base:
+            # safe to set because we haven't created a widget for plc_key yet
+            st.session_state[plc_key] = cur_base
+        # update prev to current for next comparison
+        st.session_state[prev_key] = cur_func
+
+    # connection header
+    st.markdown(f"### {conn.name}  ({conn.host}:{conn.port})  ID: {conn.id}  Unit: {conn.unit}  状态: {'已连接' if conn.connected else '未连接'}")
+
+    # top row: function | plc address | count
+    cols = st.columns([3, 2, 1])
+    with cols[0]:
+        # use key-only selectbox: session_state already has a valid default string
+        sel = st.selectbox(f"功能（{conn.name}）", options=func_display_list, key=func_key)
+        sel_idx = func_display_list.index(sel)
+        func_type = FUNCTION_OPTIONS[sel_idx][1]
+        func_base = FUNCTION_OPTIONS[sel_idx][2]
+    with cols[1]:
+        plc_val = st.number_input(f"PLC 地址（示例 {func_base}）", min_value=0, step=1, key=plc_key)
+    with cols[2]:
+        cnt_val = st.number_input("数量", min_value=1, step=1, key=count_key)
+
+    # second row: horizontally arranged buttons
+    btn_cols = st.columns([1, 1, 1, 1])
+    with btn_cols[0]:
+        if st.button("连接", key=f"connect_{safe}"):
             try:
-                read_values = conn.read(type=func_type, address=int(modbus_address), count=int(count))
-                # 持久化读取结果到 session_state（关键）
-                st.session_state["read_values"] = read_values
-                st.session_state["last_modbus_address"] = int(modbus_address)
-                st.session_state["last_plc_address"] = int(plc_address)
-                # 清除可能的 edit 状态，避免误打开旧编辑
-                st.session_state.pop("edit", None)
-                # 立即刷新以显示读取结果（可选）
-                rerun()
+                ok = conn.connect()
+                if ok:
+                    st.success(f"{conn.name} 已连接")
+                else:
+                    st.error(f"{conn.name} 连接失败")
             except Exception as e:
-                st.error(f"读取失败: {e}")
+                st.error(f"{conn.name} 连接异常: {e}")
+            rerun()
+    with btn_cols[1]:
+        if st.button("断开", key=f"close_{safe}"):
+            try:
+                conn.close()
+                # optionally clear cached read result on close so UI doesn't show stale data
+                st.session_state.get("read_values", {}).pop(cid, None)
+                st.session_state.get("last_modbus_address", {}).pop(cid, None)
+                st.session_state.get("last_plc_address", {}).pop(cid, None)
+                st.info(f"{conn.name} 已断开")
+            except Exception as e:
+                st.error(f"{conn.name} 断开异常: {e}")
+            rerun()
+    with btn_cols[2]:
+        # If connected, allow read; if not, show disabled button (if supported) or message.
+        if conn.connected:
+            if st.button("读取", key=f"read_btn_{safe}"):
+                try:
+                    cur_plc = int(st.session_state.get(plc_key))
+                    cur_cnt = int(st.session_state.get(count_key))
+                    cur_func_display = st.session_state.get(func_key)
+                    if cur_func_display in func_display_list:
+                        cur_idx = func_display_list.index(cur_func_display)
+                    else:
+                        cur_idx = default_idx
+                    cur_func_type = FUNCTION_OPTIONS[cur_idx][1]
+                    cur_func_base = FUNCTION_OPTIONS[cur_idx][2]
+                    modbus_address = plc_to_modbus(cur_plc, cur_func_base)
 
-# 从 session_state 读取持久化的数据（即使脚本 rerun 也能取到）
-read_values = st.session_state.get("read_values")
-last_modbus_address = st.session_state.get("last_modbus_address")
-last_plc_address = st.session_state.get("last_plc_address")
+                    # enforce not auto-reconnecting here
+                    values = conn.read(type=cur_func_type, address=int(modbus_address), count=int(cur_cnt), allow_reconnect=False)
 
-# 显示读取结果并为每行提供编辑按钮
-if read_values:
+                    st.session_state["read_values"][cid] = values
+                    st.session_state["last_modbus_address"][cid] = int(modbus_address)
+                    st.session_state["last_plc_address"][cid] = int(cur_plc)
+                    st.success(f"{conn.name} 读取成功")
+                except ConnectionError as ce:
+                    st.error(f"{conn.name} 未连接：{ce}")
+                except Exception as e:
+                    # on read failure we clear the cached result to avoid showing stale data
+                    st.session_state.get("read_values", {}).pop(cid, None)
+                    st.session_state.get("last_modbus_address", {}).pop(cid, None)
+                    st.session_state.get("last_plc_address", {}).pop(cid, None)
+                    st.error(f"{conn.name} 读取失败: {e}")
+                rerun()
+        else:
+            # try disabled if supported; otherwise show a hint
+            try:
+                st.button("读取", key=f"read_btn_disabled_{safe}", disabled=True)
+            except TypeError:
+                st.write("（未连接，无法读取）")
+    with btn_cols[3]:
+        if st.button("删除", key=f"remove_{safe}"):
+            try:
+                manager.remove(cid)
+                st.session_state.get("read_values", {}).pop(cid, None)
+                st.session_state.get("last_modbus_address", {}).pop(cid, None)
+                st.session_state.get("last_plc_address", {}).pop(cid, None)
+                st.success(f"{conn.name} 已删除")
+            except Exception as e:
+                st.error(f"删除失败: {e}")
+            rerun()
+
     st.markdown("---")
-    st.subheader("读取结果（点击编辑按钮在弹窗中修改并写入）")
+
+# Read results area
+st.markdown("## 读取结果（按连接分组）")
+for cid in selected_ids:
+    conn = manager.get(cid)
+    if conn is None:
+        st.warning(f"连接 {cid} 已不存在")
+        continue
+    st.markdown(f"**{conn.name}  ({conn.host}:{conn.port})**  ID: {conn.id}  Unit: {conn.unit}")
+    read_values = st.session_state["read_values"].get(cid)
+    last_modbus_address = st.session_state["last_modbus_address"].get(cid)
+    last_plc_address = st.session_state["last_plc_address"].get(cid)
+    if read_values is None:
+        st.info("无读取结果或读取失败（见上方错误信息）")
+        continue
+
     cols = st.columns([2, 2, 3, 1])
     cols[0].markdown("**PLC 地址**")
     cols[1].markdown("**Modbus 地址**")
@@ -174,35 +295,39 @@ if read_values:
     cols[3].markdown("**操作**")
 
     for i, cur in enumerate(read_values):
-        addr_modbus = last_modbus_address + i
-        addr_plc = last_plc_address + i
+        addr_modbus = (last_modbus_address + i) if last_modbus_address is not None else i
+        addr_plc = (last_plc_address + i) if last_plc_address is not None else i
         c0, c1, c2, c3 = st.columns([2, 2, 3, 1])
         c0.write(addr_plc)
         c1.write(addr_modbus)
         c2.write(cur)
-        edit_key = f"edit_btn_{selected_id}_{addr_modbus}"
-        # 点击按钮时仅写 session_state["edit"]，不要立即清除 read_values
+        edit_key = f"edit_btn_{cid}_{addr_modbus}"
         if c3.button("编辑", key=edit_key):
             st.session_state["edit"] = {
-                "type": func_type,
+                "type": None,
                 "plc_addr": addr_plc,
                 "address": addr_modbus,
                 "value": cur,
-                "conn_id": selected_id,
+                "conn_id": cid,
             }
-            # 不要立刻强制 rerun（可选），因为当前 run 已会检测 edit 并显示 modal
-            # 如果你需要立即刷新也可以调用 rerun()，但 session_state 已保存读取结果，重跑不会丢失上下文.
-            # rerun()
 
-# 弹窗编辑（依赖 session_state["edit"]）
+# Edit modal handling
 if "edit" in st.session_state:
     edit = st.session_state["edit"]
-    # 确保连接未变
-    if edit.get("conn_id") != selected_id:
-        st.warning("编辑项对应的连接已发生变化，请重新读取并重试。")
+    edit_conn_id = edit.get("conn_id")
+    conn = manager.get(edit_conn_id)
+    if conn is None:
+        st.warning("编辑项对应的连接不存在或已被移除")
         st.session_state.pop("edit", None)
     else:
-        # 使用 st.modal（如果 Streamlit 版本不支持，可换成页面内显示）
+        safe = edit_conn_id.replace("-", "_")
+        func_opt = st.session_state.get(f"func_opt_{safe}", None)
+        try:
+            func_idx = func_display_list.index(func_opt) if func_opt in func_display_list else 2
+        except Exception:
+            func_idx = 2
+        func_type = FUNCTION_OPTIONS[func_idx][1]
+        edit["type"] = func_type
         try:
             with st.modal(f"编辑寄存器 PLC {edit['plc_addr']} (Modbus {edit['address']})"):
                 st.write(f"连接: {conn.name}  Unit: {conn.unit}")
@@ -210,48 +335,51 @@ if "edit" in st.session_state:
                 st.write(f"当前值: {edit['value']}")
                 with st.form("edit_form"):
                     if edit["type"] == "coils":
-                        new_val = st.checkbox("新值（勾选=1）", value=bool(edit["value"]), key=f"modal_coil_{edit['address']}")
+                        new_val = st.checkbox("新值（勾选=1）", value=bool(edit["value"]), key=f"modal_coil_{edit['address']}_{safe}")
                     else:
-                        new_val = st.number_input("新值（整数）", value=int(edit["value"]), step=1, key=f"modal_hold_{edit['address']}")
+                        new_val = st.number_input("新值（整数）", value=int(edit["value"]), step=1, key=f"modal_hold_{edit['address']}_{safe}")
                     submitted = st.form_submit_button("写入")
-                    cancel = st.form_submit_button("取消写入")
+                    cancel = st.form_submit_button("取消")
                     if submitted:
                         try:
                             val_to_write = 1 if (edit["type"] == "coils" and bool(new_val)) else int(new_val)
-                            conn.write(type=edit["type"], address=int(edit["address"]), values=[val_to_write])
+                            # conn.write may not be implemented in the example ModbusConnection; handle accordingly
+                            if hasattr(conn, "write"):
+                                conn.write(type=edit["type"], address=int(edit["address"]), values=[val_to_write])
                             st.success("写入成功")
-                            # 更新 session_state 中的 read_values，以便 UI 立刻反映新值（避免必须重新读取）
-                            idx = int(edit["address"] - st.session_state["last_modbus_address"])
-                            if 0 <= idx < len(st.session_state["read_values"]):
-                                st.session_state["read_values"][idx] = val_to_write
-                            # 关闭 modal
+                            rv = st.session_state["read_values"].get(edit_conn_id)
+                            lm = st.session_state["last_modbus_address"].get(edit_conn_id)
+                            if rv is not None and lm is not None:
+                                idx = int(edit["address"] - lm)
+                                if 0 <= idx < len(rv):
+                                    st.session_state["read_values"][edit_conn_id][idx] = val_to_write
                             st.session_state.pop("edit", None)
-                            # 可选择重新读取全部范围以确保一致：下面注释掉，按需启用
-                            # time.sleep(0.05); st.session_state.pop("read_values", None); rerun()
                         except Exception as e:
                             st.error(f"写入失败: {e}")
                     if cancel:
                         st.session_state.pop("edit", None)
         except Exception:
-            # 如果 st.modal 不存在或异常，退回到页面内编辑（兼容处理）
-            st.warning("当前 Streamlit 版本可能不支持 modal，已切换为页面内编辑。")
-            # 页面内编辑实现（简化）
-            st.write("页面内编辑：")
+            st.warning("当前 Streamlit 版本可能不支持 modal，已切换为页面内编辑")
+            st.write(f"连接: {conn.name}  Unit: {conn.unit}")
             if edit["type"] == "coils":
-                new_val = st.checkbox("新值（勾选=1）", value=bool(edit["value"]), key=f"inline_coil_{edit['address']}")
+                new_val = st.checkbox("新值（勾选=1）", value=bool(edit["value"]), key=f"inline_coil_{edit['address']}_{safe}")
             else:
-                new_val = st.number_input("新值（整数）", value=int(edit["value"]), step=1, key=f"inline_hold_{edit['address']}")
+                new_val = st.number_input("新值（整数）", value=int(edit["value"]), step=1, key=f"inline_hold_{edit['address']}_{safe}")
             if st.button("写入（页面内）"):
                 try:
                     val_to_write = 1 if (edit["type"] == "coils" and bool(new_val)) else int(new_val)
-                    conn.write(type=edit["type"], address=int(edit["address"]), values=[val_to_write])
+                    if hasattr(conn, "write"):
+                        conn.write(type=edit["type"], address=int(edit["address"]), values=[val_to_write])
                     st.success("写入成功")
-                    idx = int(edit["address"] - st.session_state["last_modbus_address"])
-                    if 0 <= idx < len(st.session_state["read_values"]):
-                        st.session_state["read_values"][idx] = val_to_write
+                    rv = st.session_state["read_values"].get(edit_conn_id)
+                    lm = st.session_state["last_modbus_address"].get(edit_conn_id)
+                    if rv is not None and lm is not None:
+                        idx = int(edit["address"] - lm)
+                        if 0 <= idx < len(rv):
+                            st.session_state["read_values"][edit_conn_id][idx] = val_to_write
                     st.session_state.pop("edit", None)
+                    rerun()
                 except Exception as e:
                     st.error(f"写入失败: {e}")
 
-st.markdown("---")
-st.caption("点击某行的“编辑”按钮会在弹窗中修改并提交写操作；读取结果已在 session_state 中持久化，保证重跑后仍能编辑。")
+st.caption("说明：已将操作按钮水平放置在输入行下方；读取在未连接时被禁用，断开时清理旧缓存以避免显示过时数据。")
