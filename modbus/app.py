@@ -93,7 +93,7 @@ if not selected_ids:
     st.info("请选择左侧的一个或多个连接（多选）以在主区显示并分别操作。")
     st.stop()
 
-st.markdown("## 已选连接（每个连接一行：设置 + 操作按钮）")
+st.markdown("## 已选连接 ")
 
 # Function options: (display string, internal type, base address for PLC example)
 FUNCTION_OPTIONS = [
