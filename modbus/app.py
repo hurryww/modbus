@@ -1,17 +1,9 @@
-# modbus/app.py
-# Streamlit UI - full file that uses modbus_manager.manager
-# Behaviors:
-# - Create / list / remove connections
-# - For each selected connection render a single input row (function / plc address / count)
-# - Operation buttons are placed in a single horizontal row BELOW the inputs
-# - Read button is disabled when the connection is not connected; read() is called with allow_reconnect=False
-# - When switching function code, PLC address auto-updates to the new base only if user hasn't modified it
 import streamlit as st
 from modbus_manager import manager
 import time
 
 st.set_page_config(page_title="Modbus TCP Manager", layout="wide")
-st.title("Modbus TCP Manager（Python + Streamlit）")
+st.title("Modbus TCP Manager")
 
 def rerun():
     try:
@@ -161,7 +153,10 @@ for cid in selected_ids:
         prev_base = FUNCTION_OPTIONS[func_display_list.index(prev_func)][2]
 
     # PLC/count defaults
-    ensure_session_default(plc_key, cur_base if prev_base is None else prev_base)
+    # 修复点：首次渲染使用当前功能的 base（cur_base）作为默认值，
+    # 避免在 rerun / 新建连接时把其它（可能为 0 的）值作为默认。
+    ensure_session_default(plc_key, cur_base)
+
     try:
         plc_val_current = int(st.session_state.get(plc_key, cur_base))
     except Exception:
@@ -172,11 +167,10 @@ for cid in selected_ids:
     except Exception:
         st.session_state[count_key] = 4
 
-    # if function changed (prev -> cur) and user didn't modify plc (plc == prev_base), update plc to cur_base
+    # if function changed (prev -> cur) update plc to cur_base unconditionally
     if prev_func is not None and prev_func != cur_func:
-        if prev_base is not None and plc_val_current == prev_base:
-            # safe to set because we haven't created a widget for plc_key yet
-            st.session_state[plc_key] = cur_base
+        # Always set plc to the current function base when the function selection changes
+        st.session_state[plc_key] = cur_base
         # update prev to current for next comparison
         st.session_state[prev_key] = cur_func
 
@@ -343,16 +337,35 @@ if "edit" in st.session_state:
                     if submitted:
                         try:
                             val_to_write = 1 if (edit["type"] == "coils" and bool(new_val)) else int(new_val)
-                            # conn.write may not be implemented in the example ModbusConnection; handle accordingly
+                            # Ensure connected; attempt to connect if not
+                            if not conn.connected:
+                                ok = conn.connect()
+                                if not ok:
+                                    st.error("与设备连接失败，无法写入")
+                                    raise ConnectionError("connect failed")
+
+                            # Perform the write via manager's connection method
                             if hasattr(conn, "write"):
-                                conn.write(type=edit["type"], address=int(edit["address"]), values=[val_to_write])
+                                resp = conn.write(type=edit["type"], address=int(edit["address"]), values=[val_to_write])
+                            else:
+                                raise NotImplementedError("连接对象未实现 write() 方法")
+
+                            # Try read-back confirmation (best-effort)
+                            confirmed = None
+                            try:
+                                rb = conn.read(type=edit["type"], address=int(edit["address"]), count=1, allow_reconnect=False)
+                                if rb and len(rb) > 0:
+                                    confirmed = rb[0]
+                            except Exception:
+                                confirmed = None
+
                             st.success("写入成功")
                             rv = st.session_state["read_values"].get(edit_conn_id)
                             lm = st.session_state["last_modbus_address"].get(edit_conn_id)
                             if rv is not None and lm is not None:
                                 idx = int(edit["address"] - lm)
                                 if 0 <= idx < len(rv):
-                                    st.session_state["read_values"][edit_conn_id][idx] = val_to_write
+                                    st.session_state["read_values"][edit_conn_id][idx] = confirmed if confirmed is not None else val_to_write
                             st.session_state.pop("edit", None)
                         except Exception as e:
                             st.error(f"写入失败: {e}")
@@ -368,18 +381,37 @@ if "edit" in st.session_state:
             if st.button("写入（页面内）"):
                 try:
                     val_to_write = 1 if (edit["type"] == "coils" and bool(new_val)) else int(new_val)
+                    if not conn.connected:
+                        ok = conn.connect()
+                        if not ok:
+                            st.error("与设备连接失败，无法写入")
+                            raise ConnectionError("connect failed")
+
                     if hasattr(conn, "write"):
                         conn.write(type=edit["type"], address=int(edit["address"]), values=[val_to_write])
+                    else:
+                        raise NotImplementedError("连接对象未实现 write() 方法")
+
+                    # read-back
+                    confirmed = None
+                    try:
+                        rb = conn.read(type=edit["type"], address=int(edit["address"]), count=1, allow_reconnect=False)
+                        if rb and len(rb) > 0:
+                            confirmed = rb[0]
+                    except Exception:
+                        confirmed = None
+
                     st.success("写入成功")
                     rv = st.session_state["read_values"].get(edit_conn_id)
                     lm = st.session_state["last_modbus_address"].get(edit_conn_id)
                     if rv is not None and lm is not None:
                         idx = int(edit["address"] - lm)
                         if 0 <= idx < len(rv):
-                            st.session_state["read_values"][edit_conn_id][idx] = val_to_write
+                            st.session_state["read_values"][edit_conn_id][idx] = confirmed if confirmed is not None else val_to_write
                     st.session_state.pop("edit", None)
                     rerun()
                 except Exception as e:
                     st.error(f"写入失败: {e}")
 
-st.caption("说明：已将操作按钮水平放置在输入行下方；读取在未连接时被禁用，断开时清理旧缓存以避免显示过时数据。")
+st.caption("")
+
