@@ -1,12 +1,7 @@
-# modbus/modbus_manager.py
-# Modbus connection and manager implementation used by the Streamlit UI.
-# - ModbusConnection wraps pymodbus ModbusTcpClient with safe connect/close/read semantics.
-# - Manager keeps a registry of connections and helpers used by the UI (create/list/get/remove).
-# NOTE: install pymodbus (pip install pymodbus) before running.
-
 import threading
 import uuid
 import time
+import logging
 from typing import Optional, List, Any, Dict
 
 try:
@@ -17,9 +12,34 @@ except Exception:
     ModbusTcpClient = None
     ModbusIOException = Exception
 
+logger = logging.getLogger(__name__)
+
+# Default values for timeouts and retries
+DEFAULT_CONNECT_TIMEOUT = 3.0
+DEFAULT_OPERATION_TIMEOUT = 3.0
+DEFAULT_RETRIES = 0
+DEFAULT_RETRY_BACKOFF = 0.5
+
 
 class ModbusConnection:
-    def __init__(self, host: str, port: int = 502, unit: int = 1, name: Optional[str] = None):
+    def __init__(
+        self,
+        host: str,
+        port: int = 502,
+        unit: int = 1,
+        name: Optional[str] = None,
+        connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+        operation_timeout: float = DEFAULT_OPERATION_TIMEOUT,
+        retries: int = DEFAULT_RETRIES,
+        retry_backoff: float = DEFAULT_RETRY_BACKOFF,
+    ):
+        """
+        connect_timeout: (reserved) logical parameter for connect attempts, currently operation_timeout
+                         is passed to pymodbus client as socket timeout; keep both for clarity.
+        operation_timeout: socket/IO timeout used by ModbusTcpClient
+        retries: number of additional attempts for connect (0 = no retry)
+        retry_backoff: base backoff multiplier (seconds)
+        """
         self.id = str(uuid.uuid4())
         self.host = host
         self.port = int(port)
@@ -32,36 +52,87 @@ class ModbusConnection:
         # small timestamp for debugging
         self._last_connect_time: Optional[float] = None
 
-    def connect(self, timeout: float = 3.0) -> bool:
+        # configuration
+        self.connect_timeout = float(connect_timeout)
+        self.operation_timeout = float(operation_timeout)
+        self.retries = int(retries)
+        self.retry_backoff = float(retry_backoff)
+
+    def _create_client(self, timeout: float):
+        if ModbusTcpClient is None:
+            raise RuntimeError("pymodbus is not installed (pip install pymodbus)")
+        # ModbusTcpClient takes timeout which is the socket timeout for operations
+        return ModbusTcpClient(self.host, port=self.port, timeout=timeout)
+
+    def connect(self, timeout: Optional[float] = None) -> bool:
         """
         Create a new ModbusTcpClient and try to connect.
         Returns True on success, False otherwise.
+
+        Implementation notes:
+        - We avoid holding the main lock during blocking network I/O where possible.
+        - Supports configurable retries with exponential-ish backoff (linear backoff multiplied by attempt).
         """
         if ModbusTcpClient is None:
             raise RuntimeError("pymodbus is not installed (pip install pymodbus)")
 
-        with self._lock:
-            try:
-                # Close previous client if exists
-                if self.client:
-                    try:
-                        self.client.close()
-                    except Exception:
-                        pass
-                    self.client = None
-                    self.connected = False
+        # Determine effective timeout to use for client socket operations
+        effective_timeout = float(timeout) if timeout is not None else self.operation_timeout
 
-                self.client = ModbusTcpClient(self.host, port=self.port, timeout=timeout)
-                ok = self.client.connect()
-                self.connected = bool(ok)
-                if self.connected:
-                    self._last_connect_time = time.time()
-                return self.connected
-            except Exception:
-                # ensure consistent state on failure
+        # Close previous client reference in a short critical section, but do actual close outside lock
+        old_client = None
+        with self._lock:
+            if self.client:
+                old_client = self.client
                 self.client = None
                 self.connected = False
-                return False
+
+        if old_client:
+            try:
+                old_client.close()
+            except Exception:
+                logger.debug("error closing previous client", exc_info=True)
+
+        # Try to connect with retries
+        attempt = 0
+        max_attempts = 1 + max(0, self.retries)
+        last_exc = None
+        while attempt < max_attempts:
+            attempt += 1
+            try:
+                new_client = self._create_client(effective_timeout)
+                ok = new_client.connect()
+                if not ok:
+                    # some implementations return False on failure rather than raising
+                    raise ConnectionError("client.connect() returned False")
+                # Put the new client into state with a short critical section
+                with self._lock:
+                    self.client = new_client
+                    self.connected = True
+                    self._last_connect_time = time.time()
+                logger.info("connected to %s:%s (attempt %s)", self.host, self.port, attempt)
+                return True
+            except Exception as e:
+                last_exc = e
+                logger.warning(
+                    "connect attempt %s/%s failed for %s:%s: %s",
+                    attempt,
+                    max_attempts,
+                    self.host,
+                    self.port,
+                    e,
+                    exc_info=True,
+                )
+                # backoff before next attempt
+                if attempt < max_attempts:
+                    time.sleep(self.retry_backoff * attempt)
+
+        # all attempts failed, ensure consistent disconnected state
+        with self._lock:
+            self.client = None
+            self.connected = False
+        logger.error("all connect attempts failed for %s:%s: %s", self.host, self.port, last_exc)
+        return False
 
     def close(self) -> None:
         """
@@ -69,16 +140,15 @@ class ModbusConnection:
         This ensures subsequent read attempts won't reuse a stale socket.
         """
         with self._lock:
+            client = self.client
+            self.client = None
+            self.connected = False
+
+        if client:
             try:
-                if self.client:
-                    try:
-                        self.client.close()
-                    except Exception:
-                        pass
-            finally:
-                # Always clear the client reference and state
-                self.client = None
-                self.connected = False
+                client.close()
+            except Exception:
+                logger.debug("error closing client during close()", exc_info=True)
 
     def _single_read(self, type_: str, address: int, count: int) -> List[Any]:
         """
@@ -86,7 +156,11 @@ class ModbusConnection:
         Returns a Python list of values (booleans for coils/discrete, ints for registers).
         Raises exceptions on error.
         """
-        if self.client is None:
+        # short critical section to get the client reference
+        with self._lock:
+            client = self.client
+
+        if client is None:
             raise ConnectionError("No underlying client available")
 
         # Ensure using ints
@@ -95,7 +169,7 @@ class ModbusConnection:
 
         try:
             if type_ == "coils":
-                rr = self.client.read_coils(address, count, unit=self.unit)
+                rr = client.read_coils(address, count, unit=self.unit)
                 if rr is None:
                     raise ModbusIOException("No response")
                 # pymodbus response often has .bits
@@ -104,7 +178,7 @@ class ModbusConnection:
                 raise ModbusIOException("Unexpected response for coils")
 
             if type_ == "discrete":
-                rr = self.client.read_discrete_inputs(address, count, unit=self.unit)
+                rr = client.read_discrete_inputs(address, count, unit=self.unit)
                 if rr is None:
                     raise ModbusIOException("No response")
                 if hasattr(rr, "bits"):
@@ -112,7 +186,7 @@ class ModbusConnection:
                 raise ModbusIOException("Unexpected response for discrete inputs")
 
             if type_ == "holding":
-                rr = self.client.read_holding_registers(address, count, unit=self.unit)
+                rr = client.read_holding_registers(address, count, unit=self.unit)
                 if rr is None:
                     raise ModbusIOException("No response")
                 if hasattr(rr, "registers"):
@@ -120,7 +194,7 @@ class ModbusConnection:
                 raise ModbusIOException("Unexpected response for holding registers")
 
             if type_ == "input":
-                rr = self.client.read_input_registers(address, count, unit=self.unit)
+                rr = client.read_input_registers(address, count, unit=self.unit)
                 if rr is None:
                     raise ModbusIOException("No response")
                 if hasattr(rr, "registers"):
@@ -140,35 +214,45 @@ class ModbusConnection:
         - On Modbus or socket errors, set connected = False and re-raise.
         """
         with self._lock:
-            if not self.connected or self.client is None:
-                if not allow_reconnect:
-                    raise ConnectionError(f"Connection to {self.host}:{self.port} is closed")
-                ok = self.connect()
-                if not ok:
-                    raise ConnectionError(f"Auto-reconnect to {self.host}:{self.port} failed")
+            client = self.client
+            connected = self.connected
 
-            if self.client is None:
-                raise ConnectionError(f"No client available for {self.host}:{self.port}")
+        if not connected or client is None:
+            if not allow_reconnect:
+                raise ConnectionError(f"Connection to {self.host}:{self.port} is closed")
+            ok = self.connect(timeout=self.operation_timeout)
+            if not ok:
+                raise ConnectionError(f"Auto-reconnect to {self.host}:{self.port} failed")
 
-            try:
-                result = self._single_read(type, address, count)
+        # re-fetch client reference
+        with self._lock:
+            client = self.client
+
+        if client is None:
+            raise ConnectionError(f"No client available for {self.host}:{self.port}")
+
+        try:
+            result = self._single_read(type, address, count)
+            with self._lock:
                 self.last_read = result
-                return result
-            except ModbusIOException:
-                # Mark disconnected on IO problems
+            return result
+        except ModbusIOException:
+            # Mark disconnected on IO problems
+            with self._lock:
                 self.connected = False
-                raise
-            except Exception:
-                # Any other exception - mark disconnected to be safe
+            raise
+        except Exception:
+            # Any other exception - mark disconnected to be safe
+            with self._lock:
                 self.connected = False
-                raise
+            raise
 
 
 class ConnectionManager:
     """
     Simple manager maintaining ModbusConnection instances.
     Provides minimal API used by the Streamlit UI:
-    - create_connection(host, port, unit, name) -> ModbusConnection
+    - create_connection(host, port, unit, name, connect_timeout, operation_timeout, retries) -> ModbusConnection
     - list_connections() -> list[dict]
     - get(conn_id) -> ModbusConnection or None
     - remove(conn_id) -> None
@@ -178,9 +262,26 @@ class ConnectionManager:
         self._conns: Dict[str, ModbusConnection] = {}
         self._lock = threading.Lock()
 
-    def create_connection(self, host: str, port: int = 502, unit: int = 1, name: Optional[str] = None) -> ModbusConnection:
+    def create_connection(
+        self,
+        host: str,
+        port: int = 502,
+        unit: int = 1,
+        name: Optional[str] = None,
+        connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+        operation_timeout: float = DEFAULT_OPERATION_TIMEOUT,
+        retries: int = DEFAULT_RETRIES,
+    ) -> ModbusConnection:
         with self._lock:
-            conn = ModbusConnection(host=host, port=port, unit=unit, name=name)
+            conn = ModbusConnection(
+                host=host,
+                port=port,
+                unit=unit,
+                name=name,
+                connect_timeout=connect_timeout,
+                operation_timeout=operation_timeout,
+                retries=retries,
+            )
             self._conns[conn.id] = conn
             return conn
 
@@ -194,7 +295,10 @@ class ConnectionManager:
                     "host": c.host,
                     "port": c.port,
                     "unit": c.unit,
-                    "connected": c.connected
+                    "connected": c.connected,
+                    "connect_timeout": c.connect_timeout,
+                    "operation_timeout": c.operation_timeout,
+                    "retries": c.retries,
                 })
             return out
 
@@ -213,3 +317,4 @@ class ConnectionManager:
 
 # Export a single manager instance used by the UI
 manager = ConnectionManager()
+
