@@ -23,6 +23,13 @@ def ensure_session_default(key: str, default):
     if key not in st.session_state:
         st.session_state[key] = default
 
+# initialize persistent UI session keys
+ensure_session_default("read_values", {})
+ensure_session_default("last_modbus_address", {})
+ensure_session_default("last_plc_address", {})
+ensure_session_default("clone_map", {})  # mapping parent_id -> list of child_ids
+ensure_session_default("_write_flags", {})  # mapping safe_id -> bool for inline write visibility
+
 # Sidebar: create connection form
 with st.sidebar.expander("新增 Modbus TCP 连接", expanded=True):
     with st.form("create_conn"):
@@ -39,61 +46,16 @@ with st.sidebar.expander("新增 Modbus TCP 连接", expanded=True):
             except Exception as e:
                 st.error(f"创建失败: {e}")
 
-# Get connections and build selection map
+# Get connections; automatically show connections in main area
 conns = manager.list_connections()
-conn_map = {f"{c['name']} [{c['id']}]": c['id'] for c in conns} if conns else {}
-
-if conns:
-    selected_labels = st.sidebar.multiselect("选择连接（可多选，用于显示并分别操作）", options=list(conn_map.keys()))
-    selected_ids = [conn_map[label] for label in selected_labels] if selected_labels else []
-else:
-    st.sidebar.info("当前没有连接，请先创建一个")
-    selected_ids = []
-
-if st.sidebar.button("刷新连接列表"):
-    rerun()
-
-# Sidebar quick batch actions
-if selected_ids:
-    c1, c2, c3 = st.sidebar.columns([1, 1, 1])
-    with c1:
-        if st.button("批量连接所选"):
-            for cid in selected_ids:
-                c = manager.get(cid)
-                try:
-                    if c:
-                        c.connect()
-                except Exception as e:
-                    st.sidebar.error(f"{cid} 连接失败: {e}")
-            rerun()
-    with c2:
-        if st.button("批量断开所选"):
-            for cid in selected_ids:
-                c = manager.get(cid)
-                try:
-                    if c:
-                        c.close()
-                except Exception as e:
-                    st.sidebar.error(f"{cid} 断开失败: {e}")
-            rerun()
-    with c3:
-        if st.button("删除所选连接"):
-            for cid in list(selected_ids):
-                try:
-                    manager.remove(cid)
-                    # cleanup cached reads
-                    st.session_state.get("read_values", {}).pop(cid, None)
-                    st.session_state.get("last_modbus_address", {}).pop(cid, None)
-                    st.session_state.get("last_plc_address", {}).pop(cid, None)
-                except Exception as e:
-                    st.sidebar.error(f"{cid} 删除失败: {e}")
-            rerun()
+conn_map = {c["id"]: c for c in conns}
+selected_ids = [c["id"] for c in conns] if conns else []
 
 if not selected_ids:
-    st.info("请选择左侧的一个或多个连接（多选）以在主区显示并分别操作。")
+    st.info("当前没有连接，请先在侧边栏创建一个或多个连接。")
     st.stop()
 
-st.markdown("## 已选连接 ")
+st.markdown("## 已连接（自动显示所有连接，克隆项与原连接放在同一方框） ")
 
 # Function options: (display string, internal type, base address for PLC example)
 FUNCTION_OPTIONS = [
@@ -102,7 +64,6 @@ FUNCTION_OPTIONS = [
     ("03 Holding Register (4x) - Holding", "holding", 40001),
     ("04 Input Registers (3x) - Input Reg", "input", 30001),
 ]
-
 func_display_list = [opt[0] for opt in FUNCTION_OPTIONS]
 
 def plc_to_modbus(plc_addr: int, base: int) -> int:
@@ -111,52 +72,61 @@ def plc_to_modbus(plc_addr: int, base: int) -> int:
         return plc_addr - base
     return plc_addr
 
-# initialize read caches
-ensure_session_default("read_values", {})
-ensure_session_default("last_modbus_address", {})
-ensure_session_default("last_plc_address", {})
+# Clean clone_map: remove child ids that no longer exist; remove parents without children
+clean_clone_map = {}
+for parent_id, children in st.session_state["clone_map"].items():
+    valid_children = [cid for cid in children if cid in conn_map]
+    if valid_children and parent_id in conn_map:
+        clean_clone_map[parent_id] = valid_children
+st.session_state["clone_map"] = clean_clone_map
 
-# Render a row per selected connection
-for cid in selected_ids:
-    conn = manager.get(cid)
-    if conn is None:
-        st.warning(f"连接 {cid} 不存在")
-        continue
+# Build child -> parent index for quick lookup and top-level parent list
+child_to_parent = {}
+for p, childs in st.session_state["clone_map"].items():
+    for ch in childs:
+        child_to_parent[ch] = p
 
+top_level_ids = [cid for cid in selected_ids if cid not in child_to_parent]
+
+# Helper to render a single connection panel.
+# show_clone_button: True for parent panels so user can create clones; False for cloned panels.
+def render_connection_panel(conn_id: str, show_clone_button: bool):
+    conn_meta = manager.get(conn_id)
+    if conn_meta is None:
+        st.warning(f"连接 {conn_id} 不存在")
+        return
+
+    cid = conn_meta.id
     safe = cid.replace("-", "_")
     func_key = f"func_opt_{safe}"    # selectbox key (stores option string)
     plc_key = f"plc_addr_{safe}"
     count_key = f"count_{safe}"
     prev_key = f"prev_func_{safe}"   # previous function selection
+    write_flag_key = f"write_flag_{safe}"
 
-    # initialize defaults BEFORE widget creation
-    default_idx = 2
-    default_opt = func_display_list[default_idx] if 0 <= default_idx < len(func_display_list) else func_display_list[0]
-    ensure_session_default(func_key, default_opt)
+    ensure_session_default(func_key, func_display_list[2])  # default to Holding
     if st.session_state.get(func_key) not in func_display_list:
-        st.session_state[func_key] = default_opt
-
-    ensure_session_default(prev_key, st.session_state.get(func_key, default_opt))
+        st.session_state[func_key] = func_display_list[2]
+    ensure_session_default(prev_key, st.session_state.get(func_key, func_display_list[2]))
+    # store per-connection write toggle in a map to avoid too many top-level keys
+    if write_flag_key not in st.session_state.get("_write_flags", {}):
+        st.session_state["_write_flags"][write_flag_key] = False
 
     # compute current and previous bases
-    cur_func = st.session_state.get(func_key, default_opt)
-    prev_func = st.session_state.get(prev_key, None)
+    cur_func = st.session_state.get(func_key, func_display_list[2])
     try:
         cur_idx = func_display_list.index(cur_func)
         cur_base = FUNCTION_OPTIONS[cur_idx][2]
     except Exception:
-        cur_idx = default_idx
-        cur_base = FUNCTION_OPTIONS[default_idx][2]
+        cur_idx = 2
+        cur_base = FUNCTION_OPTIONS[2][2]
 
+    prev_func = st.session_state.get(prev_key, None)
     prev_base = None
     if prev_func in func_display_list:
         prev_base = FUNCTION_OPTIONS[func_display_list.index(prev_func)][2]
 
-    # PLC/count defaults
-    # 修复点：首次渲染使用当前功能的 base（cur_base）作为默认值，
-    # 避免在 rerun / 新建连接时把其它（可能为 0 的）值作为默认。
     ensure_session_default(plc_key, cur_base)
-
     try:
         plc_val_current = int(st.session_state.get(plc_key, cur_base))
     except Exception:
@@ -169,19 +139,17 @@ for cid in selected_ids:
 
     # if function changed (prev -> cur) update plc to cur_base unconditionally
     if prev_func is not None and prev_func != cur_func:
-        # Always set plc to the current function base when the function selection changes
         st.session_state[plc_key] = cur_base
-        # update prev to current for next comparison
         st.session_state[prev_key] = cur_func
 
-    # connection header
-    st.markdown(f"### {conn.name}  ({conn.host}:{conn.port})  ID: {conn.id}  Unit: {conn.unit}  状态: {'已连接' if conn.connected else '未连接'}")
+    # Panel header (display name: if name is None fall back to host:port)
+    display_name = conn_meta.name or f"{conn_meta.host}:{conn_meta.port}"
+    st.markdown(f"### {display_name}  ({conn_meta.host}:{conn_meta.port})  ID: {conn_meta.id}  Unit: {conn_meta.unit}  状态: {'已连接' if conn_meta.connected else '未连接'}")
 
     # top row: function | plc address | count
     cols = st.columns([3, 2, 1])
     with cols[0]:
-        # use key-only selectbox: session_state already has a valid default string
-        sel = st.selectbox(f"功能（{conn.name}）", options=func_display_list, key=func_key)
+        sel = st.selectbox(f"功能（{display_name}）", options=func_display_list, key=func_key)
         sel_idx = func_display_list.index(sel)
         func_type = FUNCTION_OPTIONS[sel_idx][1]
         func_base = FUNCTION_OPTIONS[sel_idx][2]
@@ -190,91 +158,150 @@ for cid in selected_ids:
     with cols[2]:
         cnt_val = st.number_input("数量", min_value=1, step=1, key=count_key)
 
-    # second row: horizontally arranged buttons
-    btn_cols = st.columns([1, 1, 1, 1])
+    # second row: Connect | Disconnect | Read | Write (and optionally Clone)
+    # For cloned connections we hide the Clone button by passing show_clone_button=False
+    btn_cols = st.columns([1, 1, 1, 1, 1])
     with btn_cols[0]:
         if st.button("连接", key=f"connect_{safe}"):
             try:
-                ok = conn.connect()
+                ok = conn_meta.connect()
                 if ok:
-                    st.success(f"{conn.name} 已连接")
+                    st.success(f"{display_name} 已连接")
                 else:
-                    st.error(f"{conn.name} 连接失败")
+                    st.error(f"{display_name} 连接失败")
             except Exception as e:
-                st.error(f"{conn.name} 连接异常: {e}")
+                st.error(f"{display_name} 连接异常: {e}")
             rerun()
     with btn_cols[1]:
         if st.button("断开", key=f"close_{safe}"):
             try:
-                conn.close()
-                # optionally clear cached read result on close so UI doesn't show stale data
+                conn_meta.close()
                 st.session_state.get("read_values", {}).pop(cid, None)
                 st.session_state.get("last_modbus_address", {}).pop(cid, None)
                 st.session_state.get("last_plc_address", {}).pop(cid, None)
-                st.info(f"{conn.name} 已断开")
+                st.info(f"{display_name} 已断开")
             except Exception as e:
-                st.error(f"{conn.name} 断开异常: {e}")
+                st.error(f"{display_name} 断开异常: {e}")
             rerun()
     with btn_cols[2]:
-        # If connected, allow read; if not, show disabled button (if supported) or message.
-        if conn.connected:
-            if st.button("读取", key=f"read_btn_{safe}"):
-                try:
-                    cur_plc = int(st.session_state.get(plc_key))
-                    cur_cnt = int(st.session_state.get(count_key))
-                    cur_func_display = st.session_state.get(func_key)
-                    if cur_func_display in func_display_list:
-                        cur_idx = func_display_list.index(cur_func_display)
-                    else:
-                        cur_idx = default_idx
-                    cur_func_type = FUNCTION_OPTIONS[cur_idx][1]
-                    cur_func_base = FUNCTION_OPTIONS[cur_idx][2]
-                    modbus_address = plc_to_modbus(cur_plc, cur_func_base)
-
-                    # enforce not auto-reconnecting here
-                    values = conn.read(type=cur_func_type, address=int(modbus_address), count=int(cur_cnt), allow_reconnect=False)
-
-                    st.session_state["read_values"][cid] = values
-                    st.session_state["last_modbus_address"][cid] = int(modbus_address)
-                    st.session_state["last_plc_address"][cid] = int(cur_plc)
-                    st.success(f"{conn.name} 读取成功")
-                except ConnectionError as ce:
-                    st.error(f"{conn.name} 未连接：{ce}")
-                except Exception as e:
-                    # on read failure we clear the cached result to avoid showing stale data
-                    st.session_state.get("read_values", {}).pop(cid, None)
-                    st.session_state.get("last_modbus_address", {}).pop(cid, None)
-                    st.session_state.get("last_plc_address", {}).pop(cid, None)
-                    st.error(f"{conn.name} 读取失败: {e}")
-                rerun()
-        else:
-            # try disabled if supported; otherwise show a hint
+        if st.button("读取", key=f"read_btn_{safe}"):
             try:
-                st.button("读取", key=f"read_btn_disabled_{safe}", disabled=True)
-            except TypeError:
-                st.write("（未连接，无法读取）")
-    with btn_cols[3]:
-        if st.button("删除", key=f"remove_{safe}"):
-            try:
-                manager.remove(cid)
+                cur_plc = int(st.session_state.get(plc_key))
+                cur_cnt = int(st.session_state.get(count_key))
+
+                cur_func_display = st.session_state.get(func_key)
+                if cur_func_display in func_display_list:
+                    cur_idx = func_display_list.index(cur_func_display)
+                else:
+                    cur_idx = cur_idx
+                cur_func_type = FUNCTION_OPTIONS[cur_idx][1]
+                cur_func_base = FUNCTION_OPTIONS[cur_idx][2]
+                modbus_address = plc_to_modbus(cur_plc, cur_func_base)
+
+                # ensure connected (try to connect if not)
+                if not conn_meta.connected:
+                    ok = conn_meta.connect()
+                    if not ok:
+                        raise ConnectionError("connect failed")
+
+                values = conn_meta.read(type=cur_func_type, address=int(modbus_address), count=int(cur_cnt))
+                st.session_state["read_values"][cid] = values
+                st.session_state["last_modbus_address"][cid] = int(modbus_address)
+                st.session_state["last_plc_address"][cid] = int(cur_plc)
+                st.success(f"{display_name} 读取成功")
+            except ConnectionError as ce:
+                st.error(f"{display_name} 未连接：{ce}")
+            except Exception as e:
                 st.session_state.get("read_values", {}).pop(cid, None)
                 st.session_state.get("last_modbus_address", {}).pop(cid, None)
                 st.session_state.get("last_plc_address", {}).pop(cid, None)
-                st.success(f"{conn.name} 已删除")
-            except Exception as e:
-                st.error(f"删除失败: {e}")
+                st.error(f"读取失败: {e}")
             rerun()
+    with btn_cols[3]:
+        write_flag = st.session_state["_write_flags"].get(write_flag_key, False)
+        if not write_flag:
+            if st.button("写入", key=f"write_toggle_{safe}"):
+                st.session_state["_write_flags"][write_flag_key] = True
+                rerun()
+        else:
+            # show inline write form
+            cur_func_display = st.session_state.get(func_key)
+            if cur_func_display in func_display_list:
+                cur_idx = func_display_list.index(cur_func_display)
+            else:
+                cur_idx = cur_idx
+            cur_func_type = FUNCTION_OPTIONS[cur_idx][1]
+            cur_func_base = FUNCTION_OPTIONS[cur_idx][2]
 
+            with st.form(f"write_form_{safe}"):
+                default_addr = int(st.session_state.get(plc_key, cur_func_base))
+                write_plc = st.number_input("PLC 地址", min_value=0, step=1, value=default_addr, key=f"write_plc_{safe}")
+                if cur_func_type == "coils":
+                    write_val = st.checkbox("新值（勾选=1）", value=False, key=f"write_coil_{safe}")
+                else:
+                    write_val = st.number_input("新值（整数）", value=0, step=1, key=f"write_hold_{safe}")
+                submit_write = st.form_submit_button("写入确认")
+                cancel_write = st.form_submit_button("取消")
+                if submit_write:
+                    try:
+                        modbus_address = plc_to_modbus(write_plc, cur_func_base)
+                        if not conn_meta.connected:
+                            ok = conn_meta.connect()
+                            if not ok:
+                                raise ConnectionError("connect failed")
+                        val_to_write = 1 if (cur_func_type == "coils" and bool(write_val)) else int(write_val)
+                        if hasattr(conn_meta, "write"):
+                            conn_meta.write(type=cur_func_type, address=int(modbus_address), value=val_to_write)
+                        st.success("写入成功")
+                        st.session_state["_write_flags"][write_flag_key] = False
+                        rerun()
+                    except Exception as e:
+                        st.error(f"写入失败: {e}")
+                if cancel_write:
+                    st.session_state["_write_flags"][write_flag_key] = False
+                    rerun()
+    with btn_cols[4]:
+        # Only show Clone button for non-clone (parent) panels
+        if show_clone_button:
+            if st.button("新建", key=f"clone_{safe}"):
+                try:
+                    clone_name = f"{conn_meta.name}_copy" if conn_meta.name else None
+                    new_conn = manager.create_connection(host=conn_meta.host, port=conn_meta.port, unit=conn_meta.unit, name=clone_name)
+                    # record clone relationship in session_state clone_map
+                    lst = st.session_state["clone_map"].setdefault(conn_meta.id, [])
+                    if new_conn.id not in lst:
+                        lst.append(new_conn.id)
+                    st.success(f"已创建新连接: {new_conn.id} ({new_conn.name})")
+                    rerun()
+                except Exception as e:
+                    st.error(f"新建连接失败: {e}")
+
+# Render groups: each top-level connection and its clones inside the same box
+for parent_id in top_level_ids:
+    # parent panel (show clone button)
+    render_connection_panel(parent_id, show_clone_button=True)
+
+    # render clones (if any) under the same visual group (no extra divider between parent and its clones)
+    children = st.session_state["clone_map"].get(parent_id, [])
+    for child_id in children:
+        # small visual indentation: use columns to simulate a boxed child area
+        cols = st.columns([0.5, 9.5])
+        with cols[0]:
+            st.write("")  # spacer column for indentation
+        with cols[1]:
+            render_connection_panel(child_id, show_clone_button=False)
+
+    # after parent + its clones, add a divider to separate groups
     st.markdown("---")
 
 # Read results area
 st.markdown("## 读取结果（按连接分组）")
 for cid in selected_ids:
-    conn = manager.get(cid)
-    if conn is None:
+    conn_meta = manager.get(cid)
+    if conn_meta is None:
         st.warning(f"连接 {cid} 已不存在")
         continue
-    st.markdown(f"**{conn.name}  ({conn.host}:{conn.port})**  ID: {conn.id}  Unit: {conn.unit}")
+    st.markdown(f"**{conn_meta.name}  ({conn_meta.host}:{conn_meta.port})**  ID: {conn_meta.id}  Unit: {conn_meta.unit}")
     read_values = st.session_state["read_values"].get(cid)
     last_modbus_address = st.session_state["last_modbus_address"].get(cid)
     last_plc_address = st.session_state["last_plc_address"].get(cid)
@@ -309,8 +336,8 @@ for cid in selected_ids:
 if "edit" in st.session_state:
     edit = st.session_state["edit"]
     edit_conn_id = edit.get("conn_id")
-    conn = manager.get(edit_conn_id)
-    if conn is None:
+    conn_meta = manager.get(edit_conn_id)
+    if conn_meta is None:
         st.warning("编辑项对应的连接不存在或已被移除")
         st.session_state.pop("edit", None)
     else:
@@ -324,7 +351,7 @@ if "edit" in st.session_state:
         edit["type"] = func_type
         try:
             with st.modal(f"编辑寄存器 PLC {edit['plc_addr']} (Modbus {edit['address']})"):
-                st.write(f"连接: {conn.name}  Unit: {conn.unit}")
+                st.write(f"连接: {conn_meta.name}  Unit: {conn_meta.unit}")
                 st.write(f"寄存器类型: {edit['type']}")
                 st.write(f"当前值: {edit['value']}")
                 with st.form("edit_form"):
@@ -337,43 +364,23 @@ if "edit" in st.session_state:
                     if submitted:
                         try:
                             val_to_write = 1 if (edit["type"] == "coils" and bool(new_val)) else int(new_val)
-                            # Ensure connected; attempt to connect if not
-                            if not conn.connected:
-                                ok = conn.connect()
+                            if not conn_meta.connected:
+                                ok = conn_meta.connect()
                                 if not ok:
                                     st.error("与设备连接失败，无法写入")
                                     raise ConnectionError("connect failed")
-
-                            # Perform the write via manager's connection method
-                            if hasattr(conn, "write"):
-                                resp = conn.write(type=edit["type"], address=int(edit["address"]), values=[val_to_write])
-                            else:
-                                raise NotImplementedError("连接对象未实现 write() 方法")
-
-                            # Try read-back confirmation (best-effort)
-                            confirmed = None
-                            try:
-                                rb = conn.read(type=edit["type"], address=int(edit["address"]), count=1, allow_reconnect=False)
-                                if rb and len(rb) > 0:
-                                    confirmed = rb[0]
-                            except Exception:
-                                confirmed = None
-
+                            if hasattr(conn_meta, "write"):
+                                conn_meta.write(type=edit["type"], address=int(edit["address"]), value=val_to_write)
                             st.success("写入成功")
-                            rv = st.session_state["read_values"].get(edit_conn_id)
-                            lm = st.session_state["last_modbus_address"].get(edit_conn_id)
-                            if rv is not None and lm is not None:
-                                idx = int(edit["address"] - lm)
-                                if 0 <= idx < len(rv):
-                                    st.session_state["read_values"][edit_conn_id][idx] = confirmed if confirmed is not None else val_to_write
                             st.session_state.pop("edit", None)
+                            rerun()
                         except Exception as e:
                             st.error(f"写入失败: {e}")
                     if cancel:
                         st.session_state.pop("edit", None)
         except Exception:
             st.warning("当前 Streamlit 版本可能不支持 modal，已切换为页面内编辑")
-            st.write(f"连接: {conn.name}  Unit: {conn.unit}")
+            st.write(f"连接: {conn_meta.name}  Unit: {conn_meta.unit}")
             if edit["type"] == "coils":
                 new_val = st.checkbox("新值（勾选=1）", value=bool(edit["value"]), key=f"inline_coil_{edit['address']}_{safe}")
             else:
@@ -381,37 +388,16 @@ if "edit" in st.session_state:
             if st.button("写入（页面内）"):
                 try:
                     val_to_write = 1 if (edit["type"] == "coils" and bool(new_val)) else int(new_val)
-                    if not conn.connected:
-                        ok = conn.connect()
+                    if not conn_meta.connected:
+                        ok = conn_meta.connect()
                         if not ok:
                             st.error("与设备连接失败，无法写入")
                             raise ConnectionError("connect failed")
-
-                    if hasattr(conn, "write"):
-                        conn.write(type=edit["type"], address=int(edit["address"]), values=[val_to_write])
-                    else:
-                        raise NotImplementedError("连接对象未实现 write() 方法")
-
-                    # read-back
-                    confirmed = None
-                    try:
-                        rb = conn.read(type=edit["type"], address=int(edit["address"]), count=1, allow_reconnect=False)
-                        if rb and len(rb) > 0:
-                            confirmed = rb[0]
-                    except Exception:
-                        confirmed = None
-
+                    if hasattr(conn_meta, "write"):
+                        conn_meta.write(type=edit["type"], address=int(edit["address"]), value=val_to_write)
                     st.success("写入成功")
-                    rv = st.session_state["read_values"].get(edit_conn_id)
-                    lm = st.session_state["last_modbus_address"].get(edit_conn_id)
-                    if rv is not None and lm is not None:
-                        idx = int(edit["address"] - lm)
-                        if 0 <= idx < len(rv):
-                            st.session_state["read_values"][edit_conn_id][idx] = confirmed if confirmed is not None else val_to_write
                     st.session_state.pop("edit", None)
                     rerun()
                 except Exception as e:
                     st.error(f"写入失败: {e}")
-
-st.caption("")
 
